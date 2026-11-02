@@ -2,7 +2,7 @@
   "name": "telegram-bot",
   "version": "1.0.0",
   "description": "Telegram bot with daily picks, multiple queues, and enrollment management",
-  "main": "api/webhook.js",
+  "main": "index.js",
   "scripts": {
     "dev": "node api/webhook.js",
     "build": "echo 'No build required'",
