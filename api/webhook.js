@@ -34,25 +34,40 @@ async function rDel(key) {
   return redis.del(key);
 }
 
-// --- Helpers ---
+// --- Per-group helpers ---
 
 function getChatId(update) {
-  return update.message?.chat?.id;
+  return update.message?.chat?.id ?? update.callback_query?.message?.chat?.id;
 }
 
 function getUserId(update) {
-  return update.message?.from?.id;
+  return update.message?.from?.id ?? update.callback_query?.from?.id;
 }
 
 function getUsername(update) {
-  return update.message?.from?.username || "unknown";
+  return update.message?.from?.username || update.callback_query?.from?.username || "unknown";
 }
 
-function isAdmin(update) {
-  const adminUsernames = (process.env.ADMIN_USERS || "TheDevilOfAntarctica").split(",");
-  return adminUsernames.includes(getUsername(update));
+/**
+ * Check if a user is an administrator of the group/channel.
+ * Uses Telegram getChatMember API — works for any group.
+ */
+async function isChatAdmin(chatId, userId) {
+  try {
+    const resp = await axios.post(`${API_BASE}/getChatMember`, {
+      chat_id: chatId,
+      user_id: userId,
+    });
+    const member = resp.data.result;
+    // user.is_member, is_administrator, is_restricted
+    return member.is_administrator === true;
+  } catch (e) {
+    console.error("getChatMember error:", e.message);
+    return false;
+  }
 }
 
+/** Send a message to a chat */
 async function sendMessage(chatId, text, parseMode = "HTML", replyMarkup = null) {
   const body = { chat_id: chatId, text, parse_mode: parseMode };
   if (replyMarkup) body.reply_markup = replyMarkup;
@@ -60,18 +75,21 @@ async function sendMessage(chatId, text, parseMode = "HTML", replyMarkup = null)
   return resp.data;
 }
 
+/** Edit an existing message */
 async function editMessageText(chatId, messageId, text, replyMarkup = null) {
   const body = { chat_id: chatId, message_id: messageId, text, parse_mode: "HTML" };
   if (replyMarkup) body.reply_markup = replyMarkup;
   await axios.post(`${API_BASE}/editMessageText`, body);
 }
 
+/** Answer callback query */
 async function answerCallbackQuery(callbackQueryId, text = null) {
   const body = { callback_query_id: callbackQueryId };
   if (text) body.text = text;
   await axios.post(`${API_BASE}/answerCallbackQuery`, body);
 }
 
+/** Parse /command args */
 function parseCommand(text) {
   if (!text || !text.startsWith("/")) return { command: "", args: [] };
   const parts = text.split(/\s+/);
@@ -88,80 +106,102 @@ function makeRegisterKeyboard(queueName) {
   };
 }
 
-function makeQueueSelectorKeyboard(queues) {
-  const rows = queues.map(q => [{ text: `🚀 Start "${q}"`, callback_data: `start:${q}` }]);
-  return { inline_keyboard: rows };
+// --- Redis state keys include chatId so bot works in any group ---
+
+/**
+ * Get queue state key: includes chatId so same queue name works per-group
+ */
+function queueKey(chatId, queueName) {
+  return `${REDIS_PREFIX}queue:${chatId}:${queueName}`;
 }
 
-function userLink(userId, name) {
-  return `<a href="tg://user?id=${userId}">${name}</a>`;
+/**
+ * Get daily eligible key: per-group
+ */
+function dailyEligibleKey(chatId) {
+  return `${REDIS_PREFIX}daily:eligible:${chatId}`;
 }
 
-// --- Queue state management via Redis ---
+/**
+ * Get "picked today" key: per-group per-day
+ */
+function pickedKey(chatId, type) {
+  const today = new Date().toISOString().split("T")[0];
+  return `${REDIS_PREFIX}${type}:${chatId}:${today}`;
+}
 
-async function getQueueState(queueName) {
-  const key = `${REDIS_PREFIX}queue:${queueName}`;
+// --- Queue state management ---
+
+async function getQueueState(chatId, queueName) {
+  const key = queueKey(chatId, queueName);
   const state = await rGet(key);
   if (!state) {
-    return { name: queueName, createdAt: Date.now(), enrolled: [], active: [], started: false, messageId: null };
+    return {
+      name: queueName,
+      chatId,
+      createdAt: Date.now(),
+      enrolled: [],
+      active: [],
+      started: false,
+      messageId: null,
+    };
   }
   return state;
 }
 
-async function saveQueueState(queueName, state) {
-  const key = `${REDIS_PREFIX}queue:${queueName}`;
+async function saveQueueState(chatId, queueName, state) {
+  const key = queueKey(chatId, queueName);
+  state.chatId = chatId;
   await rSet(key, state);
 }
 
-async function deleteQueueFromRedis(queueName) {
-  await rDel(`${REDIS_PREFIX}queue:${queueName}`);
+async function deleteQueueFromRedis(chatId, queueName) {
+  await rDel(queueKey(chatId, queueName));
 }
 
-async function getAllQueueNames() {
+/**
+ * Get all queue names for a specific chat (group)
+ */
+async function getAllQueueNamesForChat(chatId) {
   const { getRedis } = require("./lib/store");
   const redis = getRedis();
-  const keys = await redis.keys(`${REDIS_PREFIX}queue:*`);
-  return keys.map(k => k.replace(`${REDIS_PREFIX}queue:`, ""));
+  const pattern = `${REDIS_PREFIX}queue:${chatId}:*`;
+  const keys = await redis.keys(pattern);
+  return keys.map(k => k.replace(`${REDIS_PREFIX}queue:${chatId}:`, ""));
 }
 
-// --- Daily picks ---
+// --- Daily picks per-group ---
 
-async function getDailyEligible() {
-  const key = `${REDIS_PREFIX}daily:eligible`;
+async function getDailyEligible(chatId) {
+  const key = dailyEligibleKey(chatId);
   const arr = await rGet(key);
   return arr || [];
 }
 
-async function addDailyEligible(userId) {
-  const key = `${REDIS_PREFIX}daily:eligible`;
-  const arr = await getDailyEligible();
+async function addDailyEligible(chatId, userId) {
+  const key = dailyEligibleKey(chatId);
+  const arr = await getDailyEligible(chatId);
   if (!arr.includes(userId)) {
     arr.push(userId);
     await rSet(key, arr);
   }
 }
 
-async function removeDailyEligible(userId) {
-  const key = `${REDIS_PREFIX}daily:eligible`;
-  const arr = await getDailyEligible();
+async function removeDailyEligible(chatId, userId) {
+  const key = dailyEligibleKey(chatId);
+  const arr = await getDailyEligible(chatId);
   const filtered = arr.filter(id => id !== userId);
   await rSet(key, filtered);
 }
 
-async function isDailyEligible(userId) {
-  return (await getDailyEligible()).includes(userId);
-}
-
-async function alreadyPickedToday(type) {
-  const today = new Date().toISOString().split("T")[0];
-  const key = `${REDIS_PREFIX}${type}:${today}`;
+async function alreadyPickedToday(chatId, type) {
+  const key = pickedKey(chatId, type);
   const val = await rGet(key);
   return val !== null;
 }
 
-async function setPickedToday(type, userId) {
-  const today = new Date().toISOString().split("T")[0];
-  const key = `${REDIS_PREFIX}${type}:${today}`;
+async function setPickedToday(chatId, type, userId) {
+  const key = pickedKey(chatId, type);
   await rSet(key, userId, 86400 * 3); // 3 days
 }
 
@@ -183,31 +223,44 @@ app.post("/webhook", async (req, res) => {
 
       if (data.startsWith("reg:")) {
         const queueName = data.slice(4);
-        const state = await getQueueState(queueName);
+        const state = await getQueueState(chatId, queueName);
         if (!state.enrolled.includes(userId)) {
           state.enrolled.push(userId);
-          await saveQueueState(queueName, state);
+          await saveQueueState(chatId, queueName, state);
         }
-        await sendMessage(chatId, `✅ Registered for "<b>${queueName}</b>" queue!`, "HTML");
+        await sendMessage(
+          chatId,
+          `✅ Registered for "<b>${queueName}</b>" queue!`,
+          "HTML"
+        );
         if (state.started && state.active.length > 0) {
-          await presentQueue(queueName, chatId, state);
+          await presentQueue(chatId, queueName, await getQueueState(chatId, queueName));
         }
       } else if (data === "done") {
-        const queueName = await getCurrentQueueName(chatId);
-        if (queueName) {
-          const state = await getQueueState(queueName);
-          state.enrolled = state.enrolled.filter(id => id !== userId);
-          state.active = state.active.filter(id => id !== userId);
-          await popAndAppend(queueName, chatId);
-          await saveQueueState(queueName, state);
-          await presentQueue(queueName, chatId, await getQueueState(queueName));
+        // Find which queue this user is in
+        const queues = await getAllQueueNamesForChat(chatId);
+        let handled = false;
+        for (const q of queues) {
+          const state = await getQueueState(chatId, q);
+          if (state.active.includes(userId)) {
+            state.enrolled = state.enrolled.filter(id => id !== userId);
+            state.active = state.active.filter(id => id !== userId);
+            await popAndAppendQueue(chatId, q);
+            await saveQueueState(chatId, q, state);
+            await presentQueue(chatId, q, await getQueueState(chatId, q));
+            handled = true;
+            break;
+          }
+        }
+        if (!handled) {
+          await sendMessage(chatId, "You're not currently in any active queue.");
         }
       } else if (data.startsWith("start:")) {
         const queueName = data.slice(6);
-        const state = await getQueueState(queueName);
+        const state = await getQueueState(chatId, queueName);
         state.started = true;
-        await pickNextThree(queueName, chatId);
-        await saveQueueState(queueName, state);
+        await pickNextThreeQueue(chatId, queueName);
+        await saveQueueState(chatId, queueName, state);
       }
 
       res.sendStatus(200);
@@ -227,22 +280,25 @@ app.post("/webhook", async (req, res) => {
       } else if (command === "/beauty") {
         await handleDailyPick(chatId, "beauty");
       } else if (command === "/daily_pidor") {
-        if (!isAdmin(update)) {
+        // Check if admin dynamically
+        const admin = await isChatAdmin(chatId, userId);
+        if (!admin) {
           await sendMessage(chatId, "❌ Admin only.");
         } else {
           await handleDailyPick(chatId, "pidor");
         }
       } else if (command === "/daily_beauty") {
-        if (!isAdmin(update)) {
+        const admin = await isChatAdmin(chatId, userId);
+        if (!admin) {
           await sendMessage(chatId, "❌ Admin only.");
         } else {
           await handleDailyPick(chatId, "beauty");
         }
       } else if (command === "/enroll_daily") {
-        await addDailyEligible(userId);
+        await addDailyEligible(chatId, userId);
         await sendMessage(chatId, "✅ You're enrolled in daily picks!");
       } else if (command === "/unenroll_daily") {
-        await removeDailyEligible(userId);
+        await removeDailyEligible(chatId, userId);
         await sendMessage(chatId, "✅ Removed from daily picks.");
       }
 
@@ -250,15 +306,18 @@ app.post("/webhook", async (req, res) => {
 
       else if (command === "/queue") {
         if (args.length === 0) {
-          const queues = await getAllQueueNames();
+          // List queues for THIS chat only
+          const queues = await getAllQueueNamesForChat(chatId);
           if (queues.length === 0) {
-            await sendMessage(chatId, "No queues exist yet. Use /queue start <name> to create one.");
+            await sendMessage(
+              chatId,
+              "No queues exist yet. Use /queue start <name> to create one."
+            );
           } else {
             await sendMessage(
               chatId,
               `Existing queues:\n${queues.map((q, i) => `${i + 1}. ${q}`).join("\n")}\nUse /queue start <name> to start one.`,
-              "HTML",
-              makeQueueSelectorKeyboard(queues)
+              "HTML"
             );
           }
         } else if (args[0] === "start") {
@@ -267,10 +326,10 @@ app.post("/webhook", async (req, res) => {
             await sendMessage(chatId, "Usage: /queue start <name>");
           } else {
             const queueName = args[1];
-            const state = await getQueueState(queueName);
+            const state = await getQueueState(chatId, queueName);
             state.started = true;
-            await pickNextThree(queueName, chatId);
-            await saveQueueState(queueName, state);
+            await pickNextThreeQueue(chatId, queueName);
+            await saveQueueState(chatId, queueName, state);
           }
         } else if (args[0] === "delete") {
           // /queue delete <name>
@@ -278,16 +337,17 @@ app.post("/webhook", async (req, res) => {
             await sendMessage(chatId, "Usage: /queue delete <name>");
           } else {
             const queueName = args[1];
-            await deleteQueueFromRedis(queueName);
+            await deleteQueueFromRedis(chatId, queueName);
             await sendMessage(chatId, `🗑️ Queue "${queueName}" deleted.`);
           }
         } else {
           // /queue <name> - create if not exists
           const queueName = args[0];
-          const state = await getQueueState(queueName);
+          const state = await getQueueState(chatId, queueName);
           if (!state.name) {
             state.name = queueName;
-            await saveQueueState(queueName, state);
+            state.chatId = chatId;
+            await saveQueueState(chatId, queueName, state);
           }
           await sendMessage(
             chatId,
@@ -297,17 +357,23 @@ app.post("/webhook", async (req, res) => {
           );
         }
       } else if (command === "/done") {
-        const state = await getQueueState("default"); // fallback
-        const queueName = state.name || "default";
-        const q = await getQueueState(queueName);
-        if (q.active.includes(userId)) {
-          q.enrolled = q.enrolled.filter(id => id !== userId);
-          q.active = q.active.filter(id => id !== userId);
-          await popAndAppend(queueName, chatId);
-          await saveQueueState(queueName, q);
-          await presentQueue(queueName, chatId, await getQueueState(queueName));
-        } else {
-          await sendMessage(chatId, "You're not currently in the active queue.");
+        // Mark yourself done in any active queue
+        const queues = await getAllQueueNamesForChat(chatId);
+        let handled = false;
+        for (const q of queues) {
+          const state = await getQueueState(chatId, q);
+          if (state.active.includes(userId)) {
+            state.enrolled = state.enrolled.filter(id => id !== userId);
+            state.active = state.active.filter(id => id !== userId);
+            await popAndAppendQueue(chatId, q);
+            await saveQueueState(chatId, q, state);
+            await presentQueue(chatId, q, await getQueueState(chatId, q));
+            handled = true;
+            break;
+          }
+        }
+        if (!handled) {
+          await sendMessage(chatId, "You're not currently in any active queue.");
         }
       }
     }
@@ -324,74 +390,33 @@ app.post("/webhook", async (req, res) => {
   res.sendStatus(200);
 });
 
-async function handleDailyPick(chatId, type) {
-  const today = new Date().toISOString().split("T")[0];
-  const key = `${REDIS_PREFIX}${type}:${today}`;
-  const existing = await rGet(key);
-  if (existing) {
-    await sendMessage(chatId, `${type} of the day was already picked today!`);
-    return;
-  }
-
-  const eligible = await getDailyEligible();
-  if (eligible.length === 0) {
-    await sendMessage(chatId, `No one is enrolled for ${type} of the day yet.`);
-    return;
-  }
-
-  // Suspense messages
-  const suspense = [
-    "Выясним, кто тут главный pidor 😏",
-    "Проверим, все ли пишут тесты 🤔",
-    "Смотрим наличие костылей в коде 🩼",
-    "Ищем, у кого есть кружка Peder 🍺",
-    "Изучаем фото с ЛГБТ-митингов 🌈",
-  ];
-
-  for (const msg of suspense) {
-    await sendMessage(chatId, msg, "HTML");
-    await new Promise(r => setTimeout(r, 1500));
-  }
-
-  const randomIdx = Math.floor(Math.random() * eligible.length);
-  const chosen = eligible[randomIdx];
-  await setPickedToday(type, chosen);
-
-  const label = type === "pidor" ? "Pidor" : "Beauty";
-  await sendMessage(
-    chatId,
-    `${label} of the day: ${userLink(chosen, chosen.toString())}`,
-    "HTML"
-  );
-}
-
-async function getCurrentQueueName(chatId) {
-  const state = await rGet(`${REDIS_PREFIX}active_queue:${chatId}`);
-  return state ? state.queueName : null;
-}
-
-async function setCurrentQueueName(chatId, queueName) {
-  await rSet(`${REDIS_PREFIX}active_queue:${chatId}`, { queueName }, 86400 * 7);
-}
-
-async function pickNextThree(queueName, chatId) {
-  const state = await getQueueState(queueName);
+/**
+ * Pick next 3 for a queue
+ */
+async function pickNextThreeQueue(chatId, queueName) {
+  const state = await getQueueState(chatId, queueName);
   const eligible = state.enrolled.filter(id => !state.active.includes(id));
 
   if (eligible.length < 3) {
-    await sendMessage(chatId, `⚠️ Need at least 3 enrolled users for "${queueName}". Only ${eligible.length} registered.`);
+    await sendMessage(
+      chatId,
+      `⚠️ Need at least 3 enrolled users for "${queueName}". Only ${eligible.length} registered.`
+    );
     return;
   }
 
   const shuffled = eligible.sort(() => 0.5 - Math.random());
   const three = shuffled.slice(0, 3);
   state.active = three;
-  await saveQueueState(queueName, state);
-  await presentQueue(queueName, chatId, state);
+  await saveQueueState(chatId, queueName, state);
+  await presentQueue(chatId, queueName, state);
 }
 
-async function popAndAppend(queueName, chatId) {
-  const state = await getQueueState(queueName);
+/**
+ * Pop first and append new random
+ */
+async function popAndAppendQueue(chatId, queueName) {
+  const state = await getQueueState(chatId, queueName);
   if (state.active.length === 0) return;
 
   // Pop first
@@ -404,10 +429,13 @@ async function popAndAppend(queueName, chatId) {
     state.active.push(random);
   }
 
-  await saveQueueState(queueName, state);
+  await saveQueueState(chatId, queueName, state);
 }
 
-async function presentQueue(queueName, chatId, state) {
+/**
+ * Present the current queue state with Done button
+ */
+async function presentQueue(chatId, queueName, state) {
   const active = state.active;
   if (!active || active.length === 0) {
     await sendMessage(chatId, `Queue "${queueName}" is empty or finished.`);
@@ -417,7 +445,7 @@ async function presentQueue(queueName, chatId, state) {
   const text = `
 <b>Queue: ${queueName}</b>
 Current presenters:
-${active.map((uid, i) => `${i + 1}. ${userLink(uid, uid.toString())}`).join("\n")}
+${active.map((uid, i) => `${i + 1}. <a href="tg://user?id">${uid}</a>`).join("\n")}
   `.trim();
 
   if (state.messageId) {
@@ -426,24 +454,24 @@ ${active.map((uid, i) => `${i + 1}. ${userLink(uid, uid.toString())}`).join("\n"
     } catch (_) {
       const msg = await sendMessage(chatId, text, "HTML", makeDoneKeyboard());
       state.messageId = msg.message_id;
-      await saveQueueState(queueName, state);
+      await saveQueueState(chatId, queueName, state);
     }
   } else {
     const msg = await sendMessage(chatId, text, "HTML", makeDoneKeyboard());
     state.messageId = msg.message_id;
-    await saveQueueState(queueName, state);
+    await saveQueueState(chatId, queueName, state);
   }
 }
 
 // Auto-delete: queues older than 48h that were never started
 async function cleanupOldQueues() {
-  const queues = await getAllQueueNames();
+  const queues = await getAllQueueNamesForChat(chatId); // Note: need chatId here too
   const now = Date.now();
   const twoDays = 48 * 60 * 60 * 1000;
   for (const q of queues) {
-    const state = await getQueueState(q);
+    const state = await getQueueState(chatId, q);
     if (!state.started && now - state.createdAt > twoDays) {
-      await deleteQueueFromRedis(q);
+      await deleteQueueFromRedis(chatId, q);
     }
   }
 }
