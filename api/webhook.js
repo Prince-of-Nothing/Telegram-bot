@@ -239,6 +239,9 @@ app.post("/webhook", async (req, res) => {
 
       // --- Queue commands ---
 
+      if (command === "/help") {
+        await sendMessage(chatId, "Commands: /queue <name>, /queue start <name>, /pidor, /beauty, /enroll_daily, /unenroll_daily, /done");
+      }
       else if (command === "/queue") {
         if (args.length === 0) {
           const queues = await getAllQueueNamesForChat(chatId);
